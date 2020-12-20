@@ -1,0 +1,2 @@
+# The script expects game data in the CWD; ignore that
+*.dat
