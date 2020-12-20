@@ -2,7 +2,7 @@
 
 """Module for reading the Sunless Skies data files.
 
-To use, this requires the following files:
+This requires the following files:
 * Backers.dat
 * areas.dat
 * bargains.dat
@@ -19,17 +19,39 @@ Extractor. To help locate them, they all have the type "TextAsset", at the
 time of this writing they start at Path ID: 1429, and events is the single
 largest asset if you sort by size.
 
-If some of the files are missing, a warning will be printed and parsing will
-continue with the others. The most critical ones are events and qualities.
+To use, call init(), which parses the files into the following module
+constants.
+
+AREAS - A dictionary of Area objects, keyed by id.
+BACKERS - A list of strings, each one a single backer. These are in the order
+          listed in the source, which is mostly (but not entirely) alphabetical.
+BARGAINS - A dictionary of Bargain objects, keyed by id.
+EVENTS - A dictionary of Event objects, keyed by id.
+PERSONAS - A dictionary of Persona objects, keyed by id.
+PROSPECTS - A dictionary of Prospect objects, keyed by id.
+QUALITIES - A dictionary of Quality objects, keyed by id.
+SETTINGS - A dictionary of Setting objects, keyed by id.
 """
 # pylint: disable=too-few-public-methods
 
 import cProfile
 from contextlib import closing
 import io
+from os import path
 import struct
 
 _DEBUG = False
+
+AREAS = {}
+BACKERS = []
+BARGAINS = {}
+EVENTS = {}
+EXCHANGES = {}
+PERSONAS = {}
+PROSPECTS = {}
+QUALITIES = {}
+SETTINGS = {}
+
 
 class _Reader:
     """Reads binary data from a file stream"""
@@ -111,9 +133,7 @@ class _Reader:
 
     def read_string(self):
         """Read an optional string, returning None if not present"""
-        if not self.read(1)[0]:
-            return None
-        return self.read_base_string()
+        return self.read_base_string() if self.read(1)[0] else None
 
     def read_object(self, cls, /):
         """Read an optional object field, returning None if not present"""
@@ -144,11 +164,39 @@ class _Reader:
         return [cls(self) if self.read(1)[0] else None
                 for x in range(alen)]
 
-    def read_array(self, cls, /):
-        """Read an optional array of optional objects, returning None if not present"""
+    # Conditionally defined for speed: The common case (weirdly enough) is to
+    # always have the array, but with 0 size.
+    if not _DEBUG:
+        def read_array(self, cls, /):
+            """Read an optional array of optional objects, returning None if not present"""
+            read_fun = self.read
+            if not read_fun(1)[0]:
+                return None
+            alen = read_fun(4)
+            if alen == b'\0\0\0\0':
+                return []
+            alen = int.from_bytes(alen, 'little', signed=True)
+            # Arrays only have the single inner level of optionality, so we can't
+            # use read_object().
+            return [cls(self) if read_fun(1)[0] else None
+                    for x in range(alen)]
+    else:
+        def read_array(self, cls, /):
+            """Read an optional array of optional objects, returning None if not present"""
+            if not self.read(1)[0]:
+                return None
+            return self.read_raw_array(cls)
+
+    def read_array_int32(self):
+        """Read an optional array of int32s.
+
+        Needs special logic because the ints aren't optional.
+        """
         if not self.read(1)[0]:
             return None
-        return self.read_raw_array(cls)
+        read_fun = self.read_int32
+        alen = read_fun()
+        return [read_fun() for x in range(alen)]
 
 
 class Object:
@@ -207,7 +255,8 @@ class Object:
 class Area(Object):
     """Abstract areas in the game"""
 
-    _layout = """description:string
+    _layout = """
+    description:string
     image_name:string
     world:object(World)
     market_access_permitted:bool
@@ -227,7 +276,8 @@ class Area(Object):
 class AspectQPossession(Object):
     """Qualities possessed by other qualites"""
 
-    _layout = """quality:object(Quality)
+    _layout = """
+    quality:object(Quality)
     xp:int32
     effective_level_modifier:int32
     target_quality:object(Quality)
@@ -240,10 +290,61 @@ class AspectQPossession(Object):
     _labels = 'id,target_quality'
 
 
+class Availability(Object):
+    """Individual offers in a shop"""
+
+    _layout = """
+    quality:object(Quality)
+    cost:int32
+    sell_price:int32
+    in_shop:object(Shop)
+    purchase_quality:object(Quality)
+    buy_message:string
+    sell_message:string
+    sale_description:string
+    id:int32
+    """
+    _labels = 'id,quality'
+
+
+class Bargain(Object):
+    """Bargain opportunities"""
+
+    _layout = """
+    world:object(World)
+    tags:string
+    description:string
+    offer:object(Quality)
+    stock:int32
+    price:string
+    qualities_required:array(BargainQRequirement)
+    teaser:string
+    name:string
+    id:int32
+    """
+
+
+class BargainQRequirement(Object):
+    """Requirements for bargains to appear"""
+
+    _layout = """
+    custom_locked_message:string
+    custom_unlocked_message:string
+    min_level:optional_int32
+    max_level:optional_int32
+    min_advanced:string
+    max_advanced:string
+    associated_quality:object(Quality)
+    id:int32
+    """
+    _labels = 'id,min_level,max_level,associated_quality'
+
+
 class Branch(Object):
     """Story event branch"""
 
-    _layout = """success_event:object(Event)
+    _layout = """
+    success_event:object(Event)
     default_event:object(Event)
     rare_default_event:object(Event)
     rare_default_event_chance:int32
@@ -270,7 +371,8 @@ class Branch(Object):
 class BranchQRequirement(Object):
     """Branch requirements"""
 
-    _layout = """difficulty_level:optional_int32
+    _layout = """
+    difficulty_level:optional_int32
     difficulty_advanced:string
     visible_when_requirement_failed:bool
     custom_locked_message:string
@@ -286,10 +388,60 @@ class BranchQRequirement(Object):
     _labels = 'id,min_level,max_level,associated_quality'
 
 
+class Completion(Object):
+    """The details of completing a Prospect"""
+
+    _layout = """
+    prospect:object(Prospect)
+    description:string
+    satisfaction_message:string
+    qualities_affected:array(CompletionQEffect)
+    qualities_required:array(CompletionQRequirement)
+    id:int32
+    """
+
+
+class CompletionQEffect(Object):
+    """Effects on a Completion"""
+
+    _layout = """
+    force_equip:bool
+    only_if_no_more_than_advanced:string
+    only_if_at_least:optional_int32
+    only_if_no_more_than:optional_int32
+    set_to_exactly_advanced:string
+    change_by_advanced:string
+    only_if_at_least_advanced:string
+    set_to_exactly:optional_int32
+    target_quality:object(Quality)
+    target_level:optional_int32
+    completion_message:string
+    level:int32
+    associated_quality:object(Quality)
+    id:int32
+    """
+    _labels = 'id,associated_quality'
+
+
+class CompletionQRequirement(Object):
+    """Requirements for a Completion"""
+
+    _layout = """
+    min_level:optional_int32
+    max_level:optional_int32
+    min_advanced:string
+    max_advanced:string
+    associated_quality:object(Quality)
+    id:int32
+    """
+    _labels = 'id,min_level,max_level,associated_quality'
+
+
 class Deck(Object):
     """Card deck (inherited from Fallen London)"""
 
-    _layout = """world:object(World)
+    _layout = """
+    world:object(World)
     name:string
     image_name:string
     ordering:int32
@@ -301,10 +453,25 @@ class Deck(Object):
     """
 
 
+class Domicile(Object):
+    """???"""
+
+    _layout = """
+    name:string
+    description:string
+    image_name:string
+    max_hand_size:int32
+    defence_bonus:int32
+    world:object(World)
+    id:int32
+    """
+
+
 class Event(Object):
     """Events (base of all actions that happen)"""
 
-    _layout = """child_branches:array(Branch)
+    _layout = """
+    child_branches:array(Branch)
     parent_branch:object(Branch)
     qualities_affected:array(EventQEffect)
     qualities_required:array(EventQRequirement)
@@ -350,7 +517,8 @@ class Event(Object):
 class EventQEffect(Object):
     """Result of an event branch"""
 
-    _layout = """priority:optional_int32
+    _layout = """
+    priority:optional_int32
     force_equip:bool
     only_if_no_more_than_advanced:string
     only_if_at_least:optional_int32
@@ -372,7 +540,8 @@ class EventQEffect(Object):
 class EventQRequirement(Object):
     """Requirements for an entire event (as opposed to just a branch)"""
 
-    _layout = """min_level:optional_int32
+    _layout = """
+    min_level:optional_int32
     max_level:optional_int32
     min_advanced:string
     max_advanced:string
@@ -383,21 +552,164 @@ class EventQRequirement(Object):
 
 
 class Exchange(Object):
-    """Stores"""
+    """A collection of shops; more-or-less equivalent to a port"""
 
-    _layout = """id:int32"""
+    _layout = """
+    name:string
+    image:string
+    title:string
+    description:string
+    shops:array(Shop)
+    setting_ids:array_int32
+    id:int32"""
+
+
+class Persona(Object):
+    """???"""
+
+    _layout = """
+    qualities_affected:array(PersonaQEffect)
+    qualities_required:array(PersonaQRequirement)
+    description:string
+    owner_name:string
+    setting:object(Setting)
+    date_time_created:datetime
+    name:string
+    id:int32"""
+
+
+class PersonaQEffect(Object):
+    """Effects on a Persona"""
+
+    _layout = """
+    force_equip:bool
+    only_if_no_more_than_advanced:string
+    only_if_at_least:optional_int32
+    only_if_no_more_than:optional_int32
+    set_to_exactly_advanced:string
+    change_by_advanced:string
+    only_if_at_least_advanced:string
+    set_to_exactly:optional_int32
+    target_quality:object(Quality)
+    target_level:optional_int32
+    completion_message:string
+    level:int32
+    associated_quality:object(Quality)
+    id:int32
+    """
+    _labels = 'id,associated_quality'
+
+
+class PersonaQRequirement(Object):
+    """Requirements for a Persona"""
+
+    _layout = """
+    min_level:optional_int32
+    max_level:optional_int32
+    min_advanced:string
+    max_advanced:string
+    associated_quality:object(Quality)
+    id:int32
+    """
+    _labels = 'id,min_level,max_level,associated_quality'
+
+
+class Prospect(Object):
+    """???"""
+
+    _layout = """
+    world:object(World)
+    tags:string
+    description:string
+    setting:object(Setting)
+    request:object(Quality)
+    demand:int32
+    payment:string
+    qualities_affected:array(ProspectQEffect)
+    qualities_required:array(ProspectQRequirement)
+    completions:array(Completion)
+    name:string
+    id:int32"""
+
+
+class ProspectQEffect(Object):
+    """Effects on a Prospect"""
+
+    _layout = """
+    force_equip:bool
+    only_if_no_more_than_advanced:string
+    only_if_at_least:optional_int32
+    only_if_no_more_than:optional_int32
+    set_to_exactly_advanced:string
+    change_by_advanced:string
+    only_if_at_least_advanced:string
+    set_to_exactly:optional_int32
+    target_quality:object(Quality)
+    target_level:optional_int32
+    completion_message:string
+    level:int32
+    associated_quality:object(Quality)
+    id:int32
+    """
+    _labels = 'id,associated_quality'
+
+
+class ProspectQRequirement(Object):
+    """Requirements for a Prospect"""
+
+    _layout = """
+    prospect:object(Prospect)
+    custom_locked_message:string
+    custom_unlocked_message:string
+    min_level:optional_int32
+    max_level:optional_int32
+    min_advanced:string
+    max_advanced:string
+    associated_quality:object(Quality)
+    id:int32
+    """
+    _labels = 'id,min_level,max_level,associated_quality'
+
+
+class Shop(Object):
+    """A single shop within an exchange"""
+
+    _layout = """
+    name:string
+    image:string
+    description:string
+    ordering:int32
+    exchange:object(Exchange)
+    availabilities:array(Availability)
+    qualities_required:array(ShopQRequirement)
+    id:int32"""
+
+
+class ShopQRequirement(Object):
+    """Requirements for a shop to appear"""
+
+    _layout = """
+    min_level:optional_int32
+    max_level:optional_int32
+    min_advanced:string
+    max_advanced:string
+    associated_quality:object(Quality)
+    id:int32
+    """
+    _labels = 'id,min_level,max_level,associated_quality'
 
 
 class Stub(Object):
-    """Never actually deserialized, but exists in the hierarchy"""
+    """Placeholder for object types that are never actually deserialized (always None)"""
 
-    _layout = """id:int32"""
+    _layout = """id:bad_type"""
 
 
 class QEnhancement(Object):
     """Buffs associated with Qualities"""
 
-    _layout = """level:int32
+    _layout = """
+    level:int32
     associated_quality:object(Quality)
     id:int32
     """
@@ -510,7 +822,8 @@ class QEnhancement(Object):
 class Quality(Object):
     """Qualities, i.e. stuff and progression"""
 
-    _layout = """qualities_possessed:array(AspectQPossession)
+    _layout = """
+    qualities_possessed:array(AspectQPossession)
     relationship_capable:bool
     plural_name:string
     owner_name:string
@@ -558,11 +871,12 @@ class Quality(Object):
 class Setting(Object):
     """???"""
 
-    _layout = """world:object(World)
+    _layout = """
+    world:object(World)
     owner_name:string
-    personae:array(Stub)
+    personae:array(Persona)
     starting_area:object(Area)
-    starting_domicile:object(Stub)
+    starting_domicile:object(Domicile)
     items_usable_here:bool
     exchange:object(Exchange)
     turn_length_seconds:int32
@@ -578,7 +892,8 @@ class Setting(Object):
 class User(Object):
     """A bunch of stuff that was mostly inherited from Fallen London?"""
 
-    _layout = """qualities_possessed:array(UserQPossession)
+    _layout = """
+    qualities_possessed:array(UserQPossession)
     name:string
     started_in_world:object(World)
     email_address:string
@@ -628,7 +943,8 @@ class User(Object):
 class UserQPossession(Object):
     """Qualities that a user has?"""
 
-    _layout = """xp:int32
+    _layout = """
+    xp:int32
     effective_level_modifier:int32
     target_quality:object(Quality)
     target_level:optional_int32
@@ -643,7 +959,8 @@ class UserQPossession(Object):
 class UserWorldPrivilege(Object):
     """???"""
 
-    _layout = """world:object(World)
+    _layout = """
+    world:object(World)
     privilege_level:int32
     user:object(User)
     id:int32
@@ -654,7 +971,8 @@ class UserWorldPrivilege(Object):
 class World(Object):
     """A lot of general stuff"""
 
-    _layout = """general_quality_catalogue:bool
+    _layout = """
+    general_quality_catalogue:bool
     show_card_titles:bool
     character_creation_page_text:string
     end_page_text:string
@@ -695,8 +1013,33 @@ class World(Object):
     id:int32
     """
 
-with cProfile.Profile() as pr:
-    with closing(_Reader('events.dat')) as reader:
-        for elem in reader.read_raw_array(Event):
-            print(elem)
-    pr.print_stats()
+def init(root='.', /):
+    """Initialize the module constants by reading the data files.
+
+    The data is expected to be in the given directory.
+    """
+    with closing(_Reader(path.join(root, 'Backers.dat'))) as reader:
+        for backer in reader.buf_reader.read().split(b'\r\n'):
+            BACKERS.append(backer.decode())
+    if all(x == '\0' for x in BACKERS[-1]):
+        del BACKERS[-1]
+    for fname, globl, cls in [
+            ('areas.dat', AREAS, Area),
+            ('bargains.dat', BARGAINS, Bargain),
+            ('events.dat', EVENTS, Event),
+            ('exchanges.dat', EXCHANGES, Exchange),
+            ('personas.dat', PERSONAS, Persona),
+            ('prospects.dat', PROSPECTS, Prospect),
+            ('qualities.dat', QUALITIES, Quality),
+            ('settings.dat', SETTINGS, Setting)]:
+        with closing(_Reader(path.join(root, fname))) as reader:
+            for obj in reader.read_raw_array(cls):
+                globl[obj.id] = obj
+
+
+init()
+#with cProfile.Profile() as pr:
+    #with closing(_Reader('events.dat')) as reader:
+    #    for elem in reader.read_raw_array(Event):
+    #        print(elem)
+    #pr.print_stats()
