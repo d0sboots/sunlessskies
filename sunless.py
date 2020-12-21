@@ -32,7 +32,7 @@ PROSPECTS - A dictionary of Prospect objects, keyed by id.
 QUALITIES - A dictionary of Quality objects, keyed by id.
 SETTINGS - A dictionary of Setting objects, keyed by id.
 """
-# pylint: disable=too-few-public-methods
+# pylint: disable=too-few-public-methods,too-many-lines,unused-import
 
 import cProfile
 from contextlib import closing
@@ -55,19 +55,19 @@ SETTINGS = {}
 
 class _Reader:
     """Reads binary data from a file stream"""
-    __slots__ = ('buf_reader', 'read')
+    __slots__ = ('buf_reader', 'read_fun')
 
     def __init__(self, fname, /):
         self.buf_reader = io.BufferedReader(io.FileIO(fname))
         if not _DEBUG:
-            self.read = self.buf_reader.read
+            self.read_fun = self.buf_reader.read
         else:
             read_fun = self.buf_reader.read
             def print_wrapper(count):
                 result = read_fun(count)
                 print(f'Read {result!r}')
                 return result
-            self.read = print_wrapper
+            self.read_fun = print_wrapper
         # Check if the file has Unity header bits, and skip them if so.
         # Takes advantage of the fact that peek returns the whole buffer.
         start = self.buf_reader.peek()
@@ -81,22 +81,40 @@ class _Reader:
             # for the name length and the content length.
             if start[name_len+4:blen] == b'\0' * padding and all(
                 0x40 < x <= 0x7A for x in start[4:name_len+4]):
-                self.read(blen + 4)
+                self.read_fun(blen + 4)
 
     def close(self):
         """Close the reader"""
         self.buf_reader.close()
 
-    def read_unpack(self, fmt, size, /):
-        """Unpack a tuple using struct.unpack()"""
-        return struct.unpack(fmt, self.read(size))[0]
+
+class _Codegen:
+    #pylint: disable=no-self-use
+    """Performs code generation for Object.
+
+    This class contains methods that do not do actual stream parsing -
+    instead, they return code snippets that will later perform the given
+    parsing. This allows all the parsing to be inlined into a few large,
+    dynamically-generated functions, cutting out almost all method call and
+    lookup overhead. This makes a large difference given the branchy nature of
+    the structures being parsed - it cuts the runtime by 35%.
+    """
+
+    def read_float(self):
+        """Read a single-precision float"""
+        return "struct.unpack('f', read_fun(4))[0]"
 
     def read_varint(self):
         """Read a varint value from the stream"""
+        return '_Codegen.read_varint_real(read_fun)'
+
+    @staticmethod
+    def read_varint_real(read_fun):
+        """Performs actual varint decoding"""
         shift = 0
         acc = 0
         while True:
-            byte = self.read(1)[0]
+            byte = read_fun(1)[0]
             acc |= (byte & 0x7F) << shift
             if not byte & 0x80:
                 break
@@ -105,98 +123,105 @@ class _Reader:
 
     def read_bool(self):
         """Helper for reading a single bool"""
-        return self.read(1)[0]
+        return 'read_fun(1)[0]'
 
     def read_int32(self):
         """Helper for reading a single int32"""
-        return int.from_bytes(self.read(4), 'little', signed=True)
+        return "int.from_bytes(read_fun(4), 'little', signed=True)"
 
     def read_optional_int32(self):
         """Read an optional int32, returning None if not present"""
-        return self.read_int32() if self.read(1)[0] else None
+        return f'{self.read_int32()} if {self.read_bool()} else None'
 
     def read_optional_int64(self):
         """Read an optional int64, returning None if not present"""
-        if not self.read(1)[0]:
-            return None
-        return int.from_bytes(self.read(8), 'little', signed=True)
+        return ("int.from_bytes(self.read(8), 'little', signed=True) " +
+            f'if {self.read_bool()} else None')
 
     def read_base_string(self):
         """Read a base UTF-8 string"""
-        slen = self.read_varint()
-        if _DEBUG:
-            print(f'String size: 0x{slen:X}')
-        res = self.read(slen).decode()
-        if _DEBUG:
-            print('String: ' + res)
-        return res
+        if not _DEBUG:
+            return f"read_fun({self.read_varint()}).decode()"
+        return "_Codegen.debug_read_base_string(read_fun)"
+
+    @staticmethod
+    def debug_read_base_string(read_fun):
+        """Performs actual string reading, in debug only"""
+        slen = _Codegen.read_varint_real(read_fun)
+        print(f'String size: 0x{slen:X}')
+        return read_fun(slen).decode()
 
     def read_string(self):
         """Read an optional string, returning None if not present"""
-        return self.read_base_string() if self.read(1)[0] else None
+        return f'{self.read_base_string()} if {self.read_bool()} else None'
 
-    def read_object(self, cls, /):
+    def read_object(self, cls_name, /):
         """Read an optional object field, returning None if not present"""
         # There are two layers of optional: An outer one on the field and an
         # inner one on the object itself. It's essentially redundant, they
         # both mean the same thing.
-        read_fun = self.read
-        if read_fun(1)[0] and read_fun(1)[0]:
-            return cls(self)
-        return None
+        return (f'{cls_name}(read_fun, buf_reader) if {self.read_bool()} ' +
+            f'and {self.read_bool()} else None')
 
     def read_datetime(self):
-        # pylint: disable=no-self-use
         """Specialty method that doesn't actually read anything"""
-        return 0
+        return '0'
 
     def read_optional_datetime(self):
         """Specialty method that (optionally) doesn't read anything"""
-        return 0 if self.read(1)[0] else None
+        return f'0 if {self.read_bool()} else None'
 
-    def read_raw_array(self, cls, /):
+    def read_raw_array(self, cls_name, /):
         """Read an array of optional objects"""
-        alen = self.read_int32()
+        return (f'_Codegen.read_raw_array_real({cls_name}, ' +
+            'read_fun, buf_reader)')
+
+    @staticmethod
+    def read_raw_array_real(clz, read_fun, buf_reader, /):
+        """Performs actual array parsing, but not primarily used in non-debug"""
+        alen = int.from_bytes(read_fun(4), 'little', signed=True)
         if _DEBUG:
-            print(f'Array len: {alen} for {cls.__name__}')
+            print(f'Array len: {alen} for {clz.__name__}')
         # Arrays only have the single inner level of optionality, so we can't
         # use read_object().
-        return [cls(self) if self.read(1)[0] else None
+        return [clz(read_fun, buf_reader) if read_fun(1)[0] else None
                 for x in range(alen)]
 
-    # Conditionally defined for speed: The common case (weirdly enough) is to
-    # always have the array, but with 0 size.
-    if not _DEBUG:
-        def read_array(self, cls, /):
-            """Read an optional array of optional objects, returning None if not present"""
-            read_fun = self.read
-            if not read_fun(1)[0]:
-                return None
-            alen = read_fun(4)
-            if alen == b'\0\0\0\0':
-                return []
-            alen = int.from_bytes(alen, 'little', signed=True)
-            # Arrays only have the single inner level of optionality, so we can't
-            # use read_object().
-            return [cls(self) if read_fun(1)[0] else None
-                    for x in range(alen)]
+    def read_array(self, name, cls_name, /):
+        """Read an optional array of optional objects, returning None if not present
+
+        This method is special, in that it is expected to return a series of
+        statements, instead of an expression. (The calling code special-cases
+        it.) The signature is different as a result, taking the "name"
+        argument of the variable to set.
+        """
+        # Conditionally defined for speed: The common case (weirdly enough) is to
+        # always have the array, but with 0 size.
+        if _DEBUG:
+            return (f'    self.{name} = None if not {self.read_bool()} else ' +
+                    f'read_raw_array_real({cls_name}, read_fun, buf_reader)')
+        return f"""    if not {self.read_bool()}:
+        self.{name} = None
     else:
-        def read_array(self, cls, /):
-            """Read an optional array of optional objects, returning None if not present"""
-            if not self.read(1)[0]:
-                return None
-            return self.read_raw_array(cls)
+        alen = read_fun(4)
+        if alen == b'\\0\\0\\0\\0':
+            self.{name} = []
+        else:
+            alen = int.from_bytes(alen, 'little', signed=True)
+            self.{name} = [{cls_name}(read_fun, buf_reader)
+                if {self.read_bool()} else None for i in range(alen)]"""
 
     def read_array_int32(self):
         """Read an optional array of int32s.
 
         Needs special logic because the ints aren't optional.
         """
-        if not self.read(1)[0]:
-            return None
-        read_fun = self.read_int32
-        alen = read_fun()
-        return [read_fun() for x in range(alen)]
+        return (f"None if not {self.read_bool()} else " +
+                f"[{self.read_int32()} for x in range({self.read_int32()})]")
+
+    def read_bad_type(self):
+        """Used to check that a given class is never deserialized."""
+        return "0; raise ValueError('Tried to parse unexpected type')"
 
 
 class Object:
@@ -221,12 +246,41 @@ class Object:
         cls.__slots__ = tuple(x[0] for x in layout)
         # We dynamically create this code, so that it will be compiled once
         # and then run at full speed.
-        codestring = '    self.{0} = reader.read_{1}'
-        if _DEBUG:
-            codestring = ("    print(f'@{{reader.buf_reader.tell():X}} " +
-                cls.__name__ + ".{0}')\n" + codestring)
-        code = ['def __init__(self, reader):'] + [
-            codestring.format(*x) for x in layout]
+        code = ["""def __init__(self, read_fun=None, buf_reader=None, /, **kwargs):
+    if read_fun is None:"""]
+        # Start with code to initialize the object as a tuple, including the
+        # default constructor case.
+        for name, typ in layout:
+            if typ.startswith('object') or typ.startswith('optional'):
+                value = None
+            elif typ.startswith('string'):
+                value = ''
+            elif typ.startswith('array'):
+                value = []
+            elif typ.startswith('bool'):
+                value = False
+            else:
+                value = 0
+            code.append(f'        self.{name} = {value!r}')
+        code.append("""        for k, v in kwargs:
+            setattr(self, k, v)
+        return""")
+        # Otherwise, if there is a reader initialize from it.
+        codegen = _Codegen()
+        for name, typ in layout:
+            if _DEBUG:
+                code.append("    print(f'@{buf_reader.tell():X} " +
+                    f"{cls.__name__} {name}')")
+            index = typ.index('(')
+            method_name = typ[:index]
+            method = getattr(codegen, 'read_' + method_name)
+            args = []
+            if index < len(typ) - 2:
+                args.append(typ[index+1:-1])
+            if method_name == 'array':
+                code.append(method(name, *args))
+            else:
+                code.append(f'    self.{name} = ' + method(*args))
         localz = {}
         exec(compile('\n'.join(code), f'<dynamic {cls.__name__} code>', 'exec'),
                 globals(), localz)
@@ -234,7 +288,7 @@ class Object:
         __init__.__qualname__ = f'{cls.__name__}.__init__'
         cls.__init__ = __init__
         # Precompute replacement string for speed
-        fmt = ', '.join(x + '={}' for x in cls.__slots__)
+        fmt = ', '.join(x + '={!r}' for x in cls.__slots__)
         cls._repr_format = f'{cls.__name__}({fmt})'
 
         cls._str_attrs = cls._labels.split(',')
@@ -484,7 +538,7 @@ class Event(Object):
     challenge_level:int32
     uncleared_edit_at:optional_datetime
     last_edited_by:object(User)
-    ordering:unpack('f',4)
+    ordering:float
     show_as_message:bool
     living_story:object(Stub)
     link_to_event:object(Event)
@@ -1019,7 +1073,7 @@ def init(root='.', /):
     The data is expected to be in the given directory.
     """
     with closing(_Reader(path.join(root, 'Backers.dat'))) as reader:
-        for backer in reader.buf_reader.read().split(b'\r\n'):
+        for backer in reader.read_fun().split(b'\r\n'):
             BACKERS.append(backer.decode())
     if all(x == '\0' for x in BACKERS[-1]):
         del BACKERS[-1]
@@ -1033,13 +1087,17 @@ def init(root='.', /):
             ('qualities.dat', QUALITIES, Quality),
             ('settings.dat', SETTINGS, Setting)]:
         with closing(_Reader(path.join(root, fname))) as reader:
-            for obj in reader.read_raw_array(cls):
+            for obj in _Codegen.read_raw_array_real(
+                    cls, reader.read_fun, reader.buf_reader):
                 globl[obj.id] = obj
 
 
-init()
-#with cProfile.Profile() as pr:
-    #with closing(_Reader('events.dat')) as reader:
-    #    for elem in reader.read_raw_array(Event):
-    #        print(elem)
-    #pr.print_stats()
+if __name__ == '__main__':
+    #with cProfile.Profile() as pr:
+    init()
+    #    pr.print_stats()
+    for x in (AREAS, BARGAINS, EVENTS, EXCHANGES, PERSONAS, PROSPECTS, QUALITIES,
+            SETTINGS):
+        print(len(x))
+
+    print(repr(Event()))
