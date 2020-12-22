@@ -40,7 +40,7 @@ import io
 from os import path
 import struct
 
-_DEBUG = False
+_DEBUG = True
 
 AREAS = {}
 BACKERS = []
@@ -55,15 +55,16 @@ SETTINGS = {}
 
 class _Reader:
     """Reads binary data from a file stream"""
-    __slots__ = ('buf_reader', 'read_fun')
+    __slots__ = ('buf_reader', 'read_fun', 'tell_fun')
 
     def __init__(self, fname, /):
         self.buf_reader = io.BufferedReader(io.FileIO(fname))
+        self.tell_fun = self.buf_reader.tell
         if not _DEBUG:
             self.read_fun = self.buf_reader.read
         else:
             read_fun = self.buf_reader.read
-            def print_wrapper(count):
+            def print_wrapper(count=None):
                 result = read_fun(count)
                 print(f'Read {result!r}')
                 return result
@@ -82,6 +83,10 @@ class _Reader:
             if start[name_len+4:blen] == b'\0' * padding and all(
                 0x40 < x <= 0x7A for x in start[4:name_len+4]):
                 self.read_fun(blen + 4)
+
+    def get_funcs(self):
+        """Return accessors"""
+        return self.read_fun, self.tell_fun
 
     def close(self):
         """Close the reader"""
@@ -160,7 +165,7 @@ class _Codegen:
         # There are two layers of optional: An outer one on the field and an
         # inner one on the object itself. It's essentially redundant, they
         # both mean the same thing.
-        return (f'{cls_name}(read_fun, buf_reader) if {self.read_bool()} ' +
+        return (f'{cls_name}(read_fun, tell_fun) if {self.read_bool()} ' +
             f'and {self.read_bool()} else None')
 
     def read_datetime(self):
@@ -174,17 +179,17 @@ class _Codegen:
     def read_raw_array(self, cls_name, /):
         """Read an array of optional objects"""
         return (f'_Codegen.read_raw_array_real({cls_name}, ' +
-            'read_fun, buf_reader)')
+            'read_fun, tell_fun)')
 
     @staticmethod
-    def read_raw_array_real(clz, read_fun, buf_reader, /):
+    def read_raw_array_real(clz, read_fun, tell_fun, /):
         """Performs actual array parsing, but not primarily used in non-debug"""
         alen = int.from_bytes(read_fun(4), 'little', signed=True)
         if _DEBUG:
             print(f'Array len: {alen} for {clz.__name__}')
         # Arrays only have the single inner level of optionality, so we can't
         # use read_object().
-        return [clz(read_fun, buf_reader) if read_fun(1)[0] else None
+        return [clz(read_fun, tell_fun) if read_fun(1)[0] else None
                 for x in range(alen)]
 
     def read_array(self, name, cls_name, /):
@@ -199,7 +204,7 @@ class _Codegen:
         # always have the array, but with 0 size.
         if _DEBUG:
             return (f'    self.{name} = None if not {self.read_bool()} else ' +
-                    f'read_raw_array_real({cls_name}, read_fun, buf_reader)')
+                    f'_Codegen.read_raw_array_real({cls_name}, read_fun, tell_fun)')
         return f"""    if not {self.read_bool()}:
         self.{name} = None
     else:
@@ -208,7 +213,7 @@ class _Codegen:
             self.{name} = []
         else:
             alen = int.from_bytes(alen, 'little', signed=True)
-            self.{name} = [{cls_name}(read_fun, buf_reader)
+            self.{name} = [{cls_name}(read_fun, tell_fun)
                 if {self.read_bool()} else None for i in range(alen)]"""
 
     def read_array_int32(self):
@@ -246,7 +251,7 @@ class Object:
         cls.__slots__ = tuple(x[0] for x in layout)
         # We dynamically create this code, so that it will be compiled once
         # and then run at full speed.
-        code = ["""def __init__(self, read_fun=None, buf_reader=None, /, **kwargs):
+        code = ["""def __init__(self, read_fun=None, tell_fun=None, /, **kwargs):
     if read_fun is None:"""]
         # Start with code to initialize the object as a tuple, including the
         # default constructor case.
@@ -269,8 +274,8 @@ class Object:
         codegen = _Codegen()
         for name, typ in layout:
             if _DEBUG:
-                code.append("    print(f'@{buf_reader.tell():X} " +
-                    f"{cls.__name__} {name}')")
+                code.append(
+                    f"    print(f'@{{tell_fun():X}} {cls.__name__} {name}')")
             index = typ.index('(')
             method_name = typ[:index]
             method = getattr(codegen, 'read_' + method_name)
@@ -1087,8 +1092,7 @@ def init(root='.', /):
             ('qualities.dat', QUALITIES, Quality),
             ('settings.dat', SETTINGS, Setting)]:
         with closing(_Reader(path.join(root, fname))) as reader:
-            for obj in _Codegen.read_raw_array_real(
-                    cls, reader.read_fun, reader.buf_reader):
+            for obj in _Codegen.read_raw_array_real(cls, *reader.get_funcs()):
                 globl[obj.id] = obj
 
 
