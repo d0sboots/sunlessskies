@@ -3,8 +3,8 @@
 """Module for reading the Sunless Skies data files.
 
 This requires the following files:
-* Backers.dat
 * areas.dat
+* backers.dat
 * bargains.dat
 * events.dat
 * exchanges.dat
@@ -35,12 +35,13 @@ SETTINGS - A dictionary of Setting objects, keyed by id.
 # pylint: disable=too-few-public-methods,too-many-lines,unused-import
 
 import cProfile
+import collections
 from contextlib import closing
 import io
 from os import path
 import struct
 
-_DEBUG = True
+_DEBUG = False
 
 AREAS = {}
 BACKERS = []
@@ -54,7 +55,14 @@ SETTINGS = {}
 
 
 class _Reader:
-    """Reads binary data from a file stream"""
+    """Reads binary data from a file stream.
+
+    This class mostly just exposes read_fun() and tell_fun() as underlying
+    functons to call, rather than performing reading itself. This is because
+    of the inlining done by the _Codegen class, which reduces function calls
+    to the minimum possible. (BufferedReader.read() is a native function,
+    generally.)
+    """
     __slots__ = ('buf_reader', 'read_fun', 'tell_fun')
 
     def __init__(self, fname, /):
@@ -85,7 +93,7 @@ class _Reader:
                 self.read_fun(blen + 4)
 
     def get_funcs(self):
-        """Return accessors"""
+        """Return the accessors"""
         return self.read_fun, self.tell_fun
 
     def close(self):
@@ -103,6 +111,15 @@ class _Codegen:
     dynamically-generated functions, cutting out almost all method call and
     lookup overhead. This makes a large difference given the branchy nature of
     the structures being parsed - it cuts the runtime by 35%.
+
+    Almost all of the code snippets are expressions, which allows them to be
+    recursively inlined into larger snippets by simply calling the appropriate
+    function. The exception is read_array, which returns a sequence of
+    statements.
+
+    Some code is too complicated to be done in an expression, and is
+    implemented in an actual function. These are annotated with @staticmethed,
+    and are off the common path.
     """
 
     def read_float(self):
@@ -139,9 +156,11 @@ class _Codegen:
         return f'{self.read_int32()} if {self.read_bool()} else None'
 
     def read_optional_int64(self):
-        """Read an optional int64, returning None if not present"""
-        return ("int.from_bytes(self.read(8), 'little', signed=True) " +
-            f'if {self.read_bool()} else None')
+        """Read an optional int64, returning None if not present
+
+        There aren't actually any int64s in the data.
+        """
+        return ('unexpected_int64 if {self.read_bool()} else None')
 
     def read_base_string(self):
         """Read a base UTF-8 string"""
@@ -236,6 +255,9 @@ class Object:
     they simply describe their layout. This class sets up the code for
     each subclass by hooking __init_subclass__ so it can do parsing, __repr__,
     etc., without needing a full-blown metaclass.
+
+    All methods besides __init_subclass__ are meant to be called on
+    (all) subclasses.
     """
 
     _labels = 'id,name'
@@ -301,7 +323,13 @@ class Object:
         cls._str_format = f'{cls.__name__}({fmt})'
 
     def __repr__(self):
-        """Print all the attributes of the class"""
+        """Print all the attributes of the class
+
+        The result should be an expression that will round-trip back to the
+        original result (assuming you did import * form sunlessskies),
+        although it will probably be unreadably large in the complicated
+        cases.
+        """
         return self._repr_format.format(
                 *[getattr(self, x) for x in self.__slots__])
 
@@ -1072,36 +1100,53 @@ class World(Object):
     id:int32
     """
 
-def init(root='.', /):
-    """Initialize the module constants by reading the data files.
+_ALL_DATA_TYPES = [
+    ('areas', Area),
+    ('bargains', Bargain),
+    ('events', Event),
+    ('exchanges', Exchange),
+    ('personas', Persona),
+    ('prospects', Prospect),
+    ('qualities', Quality),
+    ('settings', Setting)]
 
-    The data is expected to be in the given directory.
-    """
-    with closing(_Reader(path.join(root, 'Backers.dat'))) as reader:
-        for backer in reader.read_fun().split(b'\r\n'):
-            BACKERS.append(backer.decode())
-    if all(x == '\0' for x in BACKERS[-1]):
-        del BACKERS[-1]
-    for fname, globl, cls in [
-            ('areas.dat', AREAS, Area),
-            ('bargains.dat', BARGAINS, Bargain),
-            ('events.dat', EVENTS, Event),
-            ('exchanges.dat', EXCHANGES, Exchange),
-            ('personas.dat', PERSONAS, Persona),
-            ('prospects.dat', PROSPECTS, Prospect),
-            ('qualities.dat', QUALITIES, Quality),
-            ('settings.dat', SETTINGS, Setting)]:
-        with closing(_Reader(path.join(root, fname))) as reader:
-            for obj in _Codegen.read_raw_array_real(cls, *reader.get_funcs()):
-                globl[obj.id] = obj
+_VALID_TYPES = [x[0] for x in _ALL_DATA_TYPES] + ['backers']
+
+GameData = collections.namedtuple('GameData', _VALID_TYPES)
+
+def load_backers(fname=None, /):
+    fname = fname or 'backers.dat'
+    with closing(_Reader(fname)) as reader:
+        backers = [x.decode() for x in reader.read_fun().split(b'\r\n')]
+    if all(x == '\0' for x in backers[-1]):
+        del backers[-1]
+    return backers
+
+def load_data(data_type, fname=None, /):
+    """Load a single data file"""
+    if data_type not in _VALID_TYPES:
+        raise ValueError(
+            f'{data_type!r} is not one of the valid types: {_VALID_TYPES}')
+    if data_type == 'backers':
+        return load_backers(fname)
+    if not fname:
+        fname = data_type + '.dat'
+    cls = _ALL_DATA_TYPES[_VALID_TYPES.index(data_type)][1]
+    with closing(_Reader(fname)) as reader:
+        return _Codegen.read_raw_array_real(cls, *reader.get_funcs())
+
+def load_all(root_dir='.', /):
+    """Load all the data files into a NamedTuple"""
+    data = dict((x, load_data(x, path.join(root_dir, x + '.dat')))
+                for x in _VALID_TYPES)
+    return GameData(**data)
 
 
 if __name__ == '__main__':
     #with cProfile.Profile() as pr:
-    init()
+    data = load_all()
     #    pr.print_stats()
-    for x in (AREAS, BARGAINS, EVENTS, EXCHANGES, PERSONAS, PROSPECTS, QUALITIES,
-            SETTINGS):
-        print(len(x))
+    for thing in data:
+        print(len(thing))
 
     print(repr(Event()))
