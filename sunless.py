@@ -1,5 +1,3 @@
-#!/usr/bin/python3
-
 """Module for reading the Sunless Skies data files.
 
 This requires the following files:
@@ -19,39 +17,32 @@ Extractor. To help locate them, they all have the type "TextAsset", at the
 time of this writing they start at Path ID: 1429, and events is the single
 largest asset if you sort by size.
 
-To use, call init(), which parses the files into the following module
-constants.
-
-AREAS - A dictionary of Area objects, keyed by id.
-BACKERS - A list of strings, each one a single backer. These are in the order
-          listed in the source, which is mostly (but not entirely) alphabetical.
-BARGAINS - A dictionary of Bargain objects, keyed by id.
-EVENTS - A dictionary of Event objects, keyed by id.
-PERSONAS - A dictionary of Persona objects, keyed by id.
-PROSPECTS - A dictionary of Prospect objects, keyed by id.
-QUALITIES - A dictionary of Quality objects, keyed by id.
-SETTINGS - A dictionary of Setting objects, keyed by id.
+To use, call load_all(), which parses the files into a GameData object, or
+call load_data() to load a single data type.
 """
 # pylint: disable=too-few-public-methods,too-many-lines,unused-import
 
 import collections
 from contextlib import closing
+from enum import IntEnum
 import io
 from os import path
-import struct
+from struct import unpack
+
+__all__ = [
+    'Area', 'AspectQPossession', 'Availability', 'Bargain',
+    'BargainQRequirement', 'Branch', 'BranchQRequirement', 'Category',
+    'Completion', 'CompletionQEffect', 'CompletionQRequirement', 'Deck',
+    'DifficultyTestType', 'Domicile', 'Event', 'EventCategory',
+    'EventQEffect', 'EventQRequirement', 'Exchange', 'Frequency', 'GameData',
+    'IntEnum', 'Nature', 'Object', 'Persona', 'PersonaQEffect',
+    'PersonaQRequirement', 'Prospect', 'ProspectQEffect',
+    'ProspectQRequirement', 'QEnhancement', 'Quality', 'QualityAllowedOn',
+    'Setting', 'Shop', 'ShopQRequirement', 'Stub', 'Urgency', 'User',
+    'UserQPossession', 'UserWorldPrivilege', 'World',
+    'load_all', 'load_data']
 
 _DEBUG = False
-
-AREAS = {}
-BACKERS = []
-BARGAINS = {}
-EVENTS = {}
-EXCHANGES = {}
-PERSONAS = {}
-PROSPECTS = {}
-QUALITIES = {}
-SETTINGS = {}
-
 
 class _Reader:
     """Reads binary data from a file stream.
@@ -64,8 +55,8 @@ class _Reader:
     """
     __slots__ = ('buf_reader', 'read_fun', 'tell_fun')
 
-    def __init__(self, fname, /):
-        self.buf_reader = io.BufferedReader(io.FileIO(fname))
+    def __init__(self, filename, /):
+        self.buf_reader = io.BufferedReader(io.FileIO(filename))
         self.tell_fun = self.buf_reader.tell
         if not _DEBUG:
             self.read_fun = self.buf_reader.read
@@ -123,14 +114,14 @@ class _Codegen:
 
     def read_float(self):
         """Read a single-precision float"""
-        return "struct.unpack('f', read_fun(4))[0]"
+        return "unpack('f', read_fun(4))[0]"
 
     def read_varint(self):
         """Read a varint value from the stream"""
-        return '_Codegen.read_varint_real(read_fun)'
+        return '_Codegen._read_varint_real(read_fun)'
 
     @staticmethod
-    def read_varint_real(read_fun):
+    def _read_varint_real(read_fun):
         """Performs actual varint decoding"""
         shift = 0
         acc = 0
@@ -173,12 +164,12 @@ class _Codegen:
         """Read a base UTF-8 string"""
         if not _DEBUG:
             return f"read_fun({self.read_varint()}).decode()"
-        return "_Codegen.debug_read_base_string(read_fun)"
+        return "_Codegen._debug_read_base_string(read_fun)"
 
     @staticmethod
-    def debug_read_base_string(read_fun):
+    def _debug_read_base_string(read_fun):
         """Performs actual string reading, in debug only"""
-        slen = _Codegen.read_varint_real(read_fun)
+        slen = _Codegen._read_varint_real(read_fun)
         print(f'String size: 0x{slen:X}')
         return read_fun(slen).decode()
 
@@ -193,6 +184,14 @@ class _Codegen:
         # both mean the same thing.
         return (f'{cls_name}(read_fun, tell_fun) if {self.read_byte()} ' +
             f'and {self.read_byte()} else None')
+
+    def read_enum(self, cls_name, /):
+        """Read an enum, which is just a typed int"""
+        return f'{cls_name}({self.read_int32()})'
+
+    def read_optional_enum(self, cls_name, /):
+        """Read an optional enum, returning None if not present"""
+        return f'{self.read_enum(cls_name)} if {self.read_byte()} else None'
 
     def read_datetime(self):
         """Specialty method that doesn't actually read anything"""
@@ -488,7 +487,7 @@ class Branch(Object):
     date_time_created:datetime
     currency_cost:int32
     archived:bool
-    rename_quality_category:optional_int32
+    rename_quality_category:optional_enum(Category)
     button_text:string
     ordering:int32
     act:object(Stub)
@@ -515,6 +514,94 @@ class BranchQRequirement(Object):
     associated_quality:object(Quality)
     id:int32
     """
+
+
+class Category(IntEnum):
+    """The more fine-grained categorization of a Quality.
+
+    Some of these have significant in-game effects (the various Modules
+    determine their equippable slots based on the Category, for instance.)
+    Others just categorize things in different tabs in the UI. And some are
+    just legacy hold-overs from other games, like the Hat/Gloves/Boots etc.
+    clothing categories.
+    """
+    UNSPECIFIED = 0
+    CURRENCY = 1
+    WEAPON = 101
+    HAT = 103
+    GLOVES = 104
+    BOOTS = 105
+    COMPANION = 106
+    CLOTHING = 107
+    CURIOSITY = 150
+    ADVANTAGE = 160
+    DOCUMENT = 170
+    GOODS = 200
+    BASIC_ABILITY = 1000
+    SPECIFIC_ABILITY = 2000
+    PROFESSION = 3000
+    STORY = 5000
+    INTRIGUE = 5001
+    DREAMS = 5002
+    REPUTATION = 5003
+    QUIRK = 5004
+    ACQUAINTANCE = 5025
+    ACCOMPLISHMENT = 5050
+    VENTURE = 5100
+    PROGRESS = 5200
+    MENACE = 5500
+    CONTACTS = 6000
+    HIDDEN = 6661
+    RANDOMIZER = 6662
+    AMBITION = 7000
+    ROUTE = 8000
+    SEASONAL = 9000
+    SHIP = 10000
+    CONSTANT_COMPANION = 11000
+    CLUB = 12000
+    AFFILIATION = 13000
+    TIMER = 13999
+    TRANSPORTATION = 14000
+    HOME_COMFORT = 15000
+    ACADEMIC = 16000
+    CARTOGRAPHY = 17000
+    CONTRABAND = 18000
+    ELDER = 19000
+    INFERNAL = 20000
+    INFLUENCE = 21000
+    LITERATURE = 22000
+    LODGINGS = 22500
+    LUMINOSITY = 23000
+    MYSTERIES = 24000
+    NOSTALGIA = 25000
+    RAG_TRADE = 26000
+    RATNESS = 27000
+    RUMOUR = 28000
+    LEGAL = 29000
+    WILD_WORDS = 30000
+    WINES = 31000
+    RUBBERY = 32000
+    SIDEBAR_ABILITY = 33000
+    MAJOR_LATERAL = 34000
+    QUEST = 35000
+    MINOR_LATERAL = 36000
+    CIRCUMSTANCE = 37000
+    AVATAR = 39000
+    OBJECTIVE = 40000
+    KEY = 45000
+    KNOWLEDGE = 50000
+    DESTINY = 60000
+    MODFIER = 70000
+    GREAT_GAME = 70001
+    ZEE_TREASURES = 70002
+    SUSTENANCE = 70003
+    BRIDGE = 70004
+    PLATING = 70005
+    AUXILIARY = 70006
+    SMALL_WEAPON = 70007
+    LARGE_WEAPON = 70008
+    SCOUT = 70009
+    ENGINE = 70010
 
 
 class Completion(Object):
@@ -565,7 +652,11 @@ class CompletionQRequirement(Object):
 
 
 class Deck(Object):
-    """Card deck (inherited from Fallen London)"""
+    """Card deck (inherited from Fallen London).
+
+    It is not currently clear how effect the Deck has, if any, on events as
+    they play out in Sunless Skies.
+    """
 
     _layout = """
     world:object(World)
@@ -573,11 +664,24 @@ class Deck(Object):
     image_name:string
     ordering:int32
     description:string
-    availability:int32
+    availability:enum(Frequency)
     draw_size:int32
     max_cards:int32
     id:int32
     """
+
+
+class DifficultyTestType(IntEnum):
+    """Determines how difficulty tests are interpreted.
+
+    The default, BROAD, is typical. See
+    https://fallenlondon.fandom.com/wiki/Broad_difficulty for details on how
+    it works, and how it differs from NARROW difficulty. (The link is for
+    Fallen London, but all of Failbetter's games operate the same in these
+    low-level mechanics.)
+    """
+    BROAD = 0
+    NARROW = 1
 
 
 class Domicile(Object):
@@ -616,7 +720,7 @@ class Event(Object):
     living_story:object(Stub)
     link_to_event:object(Event)
     deck:object(Deck)
-    category:int32
+    category:enum(EventCategory)
     limited_to_area:object(Area)
     world:object(World)
     transient:bool
@@ -629,7 +733,7 @@ class Event(Object):
     booty_value:int32
     log_in_journal_against_quality:object(Quality)
     setting:object(Setting)
-    urgency:int32
+    urgency:enum(Urgency)
     teaser:string
     owner_name:string
     date_time_created:datetime
@@ -639,6 +743,24 @@ class Event(Object):
     name:string
     id:int32
     """
+
+
+class EventCategory(IntEnum):
+    """The category of an Event.
+
+    It's not entirely clear how these are used.
+    """
+    UNSPECIALISED = 0
+    QUESTICLE_START = 1
+    QUESTICLE_STEP = 2
+    QUESTICLE_END = 3
+    AMBITION = 4
+    EPISODIC = 5
+    SEASONAL = 6
+    TRAVEL = 7
+    GOLD = 8
+    SINISTER = 9
+    ITEM_USE = 10
 
 
 class EventQEffect(Object):
@@ -687,6 +809,36 @@ class Exchange(Object):
     shops:array(Shop)
     setting_ids:array_int32
     id:int32"""
+
+
+class Frequency(IntEnum):
+    """Used by Deck, i.e. not very important"""
+    SOMETIMES = 0
+    RARELY = 1
+    ALWAYS = 10
+
+
+class Nature(IntEnum):
+    """The Nature of Qualities.
+
+    Theoretically, this determines a rough categorization between "things"
+    that have some sort of physical-ish presence (and thus would appear in
+    your inventory) and statuses, which do not. And for the most part, that
+    distinction holds. However, the game doesn't seem to do anything with
+    this, relying on Category instead. (For instance, everything that appears
+    in your Hold is either GOODS or belongs to a ship equipment Category.)
+
+    This is further emphasized by the small but significant number of
+    Qualities with the UNKNOWN_3 Nature, which is not defined by the game
+    itself. (The game's enum ends at THING, but C# allows enums to have values
+    outside their defined values.) They don't have any obvious distinguishing
+    feature from the rest of the data, which adds weight to the theory that
+    Nature is vestigial.
+    """
+    UNSPECIFIED = 0
+    STATUS = 1
+    THING = 2
+    UNKNOWN_3 = 3
 
 
 class Persona(Object):
@@ -834,109 +986,6 @@ class QEnhancement(Object):
     id:int32
     """
 
-# public enum QualityAllowedOn
-# {
-#     Unspecified,
-#     Character,
-#     QualityAndCharacter,
-#     Event,
-#     Branch,
-#     Persona,
-#     User
-# }
-
-# public enum DifficultyTestType
-# {
-#     Broad,
-#     Narrow
-# }
-
-# public enum Nature
-# {
-#     Unspecified,
-#     Status,
-#     Thing
-# }
-
-# public enum Category
-# {
-#     Academic = 16000,
-#     Accomplishment = 5050,
-#     Acquaintance = 5025,
-#     Advantage = 160,
-#     Affiliation = 13000,
-#     Ambition = 7000,
-#     Avatar = 39000,
-#     BasicAbility = 1000,
-#     Boots = 105,
-#     Cartography = 17000,
-#     Circumstance = 37000,
-#     Clothing = 107,
-#     Club = 12000,
-#     Companion = 106,
-#     ConstantCompanion = 11000,
-#     Contacts = 6000,
-#     Contraband = 18000,
-#     Curiosity = 150,
-#     Currency = 1,
-#     Destiny = 60000,
-#     Document = 170,
-#     Dreams = 5002,
-#     Elder = 19000,
-#     Gloves = 104,
-#     Goods = 200,
-#     GreatGame = 70001,
-#     Hat = 103,
-#     HomeComfort = 15000,
-#     Infernal = 20000,
-#     Influence = 21000,
-#     Intrigue = 5001,
-#     Key = 45000,
-#     Knowledge = 50000,
-#     Legal = 29000,
-#     Literature = 22000,
-#     Lodgings = 22500,
-#     Luminosity = 23000,
-#     MajorLateral = 34000,
-#     Menace = 5500,
-#     MinorLateral = 36000,
-#     Modfier = 70000,
-#     Mysteries = 24000,
-#     Nostalgia = 25000,
-#     Objective = 40000,
-#     Profession = 3000,
-#     Progress = 5200,
-#     Quest = 35000,
-#     Quirk = 5004,
-#     RagTrade = 26000,
-#     Ratness = 27000,
-#     Reputation = 5003,
-#     Route = 8000,
-#     Rubbery = 32000,
-#     Rumour = 28000,
-#     Sustenance = 70003,
-#     Seasonal = 9000,
-#     Ship = 10000,
-#     SidebarAbility = 33000,
-#     SpecificAbility = 2000,
-#     Story = 5000,
-#     Timer = 13999,
-#     Transportation = 14000,
-#     Unspecified = 0,
-#     Venture = 5100,
-#     Weapon = 101,
-#     WildWords = 30000,
-#     Wines = 31000,
-#     Hidden = 6661,
-#     Randomizer = 6662,
-#     ZeeTreasures = 70002,
-#     Bridge = 70004,
-#     Plating = 70005,
-#     Auxiliary = 70006,
-#     SmallWeapon = 70007,
-#     LargeWeapon = 70008,
-#     Scout = 70009
-# }
 
 class Quality(Object):
     """Qualities, i.e. stuff and progression"""
@@ -972,11 +1021,11 @@ class Quality(Object):
     enhancements_description:string
     second_chance_quality:object(Quality)
     use_event:object(Event)
-    difficulty_test_type:int32
+    difficulty_test_type:enum(DifficultyTestType)
     difficulty_scaler:int32
-    allowed_on:int32
-    nature:int32
-    category:int32
+    allowed_on:enum(QualityAllowedOn)
+    nature:enum(Nature)
+    category:enum(Category)
     level_description_text:string
     change_description_text:string
     descending_change_description_text:string
@@ -985,6 +1034,18 @@ class Quality(Object):
     name:string
     id:int32
     """
+
+class QualityAllowedOn(IntEnum):
+    """Specifies which sub-types Qualities are allowed.
+
+    Useful to the game engine, but of less use to us."""
+    UNSPECIFIED = 0
+    CHARACTER = 1
+    QUALITY_AND_CHARACTER = 2
+    EVENT = 3
+    BRANCH = 4
+    PERSONA = 5
+    USER = 6
 
 
 class Setting(Object):
@@ -1006,6 +1067,17 @@ class Setting(Object):
     name:string
     id:int32
     """
+
+
+class Urgency(IntEnum):
+    """How urgent an Event is.
+
+    This probably effects prioritization of Events, but it's not clear how.
+    """
+    LOW = -1
+    NORMAL = 0
+    HIGH = 3
+    MUST = 10
 
 
 class User(Object):
@@ -1032,16 +1104,16 @@ class User(Object):
     source:string
     entered_via_content_id:int32
     entered_via_character_id:int32
-    status:int32
+    status:enum(UserStatus)
     email_verified:bool
-    echo_via_network:int32
-    message_via_network:int32
+    echo_via_network:enum(ViaNetwork)
+    message_via_network:enum(ViaNetwork)
     message_about_nastiness:bool
     message_about_niceness:bool
     message_about_announcements:bool
     story_event_message:bool
-    default_privilege_level:int32
-    logged_in_via:int32
+    default_privilege_level:enum(PrivilegeLevel)
+    logged_in_via:enum(LoggedInVia)
     is_broadcast_target:bool
     mystery_prize_tracking:int32
     recruited:int32
@@ -1079,7 +1151,7 @@ class UserWorldPrivilege(Object):
 
     _layout = """
     world:object(World)
-    privilege_level:int32
+    privilege_level:enum(PrivilegeLevel)
     user:object(User)
     id:int32
     """
@@ -1125,8 +1197,8 @@ class World(Object):
     system_from_email_address:string
     last_updated:datetime
     update_notes:string
-    publish_state:int32
-    genre:int32
+    publish_state:enum(PublishState)
+    genre:enum(Genre)
     id:int32
     """
 
@@ -1142,38 +1214,44 @@ _ALL_DATA_TYPES = [
 
 _VALID_TYPES = [x[0] for x in _ALL_DATA_TYPES] + ['backers']
 
-GameData = collections.namedtuple('GameData', _VALID_TYPES)
-
-def load_backers(fname=None, /):
-    """Load the backers list"""
-    fname = fname or 'backers.dat'
-    with closing(_Reader(fname)) as reader:
+def _load_backers(filename=None, /):
+    """Load the backers list."""
+    filename = filename or 'backers.dat'
+    with closing(_Reader(filename)) as reader:
         backers = [x.decode() for x in reader.read_fun().split(b'\r\n')]
     if all(x == '\0' for x in backers[-1]):
         del backers[-1]
     return backers
 
-def load_data(data_type, fname=None, /):
-    """Load a single data file"""
+def load_data(data_type, filename=None, /):
+    """Load a single data file.
+
+    The data_type is one of the filenames listed in the module docstring, but
+    without '.dat'. The filename defaults the the data_type + '.dat', in the
+    current directory, but can be overridden.
+    """
     if data_type not in _VALID_TYPES:
         raise ValueError(
             f'{data_type!r} is not one of the valid types: {_VALID_TYPES}')
     if data_type == 'backers':
-        return load_backers(fname)
-    if not fname:
-        fname = data_type + '.dat'
+        return _load_backers(filename)
+    if not filename:
+        filename = data_type + '.dat'
     cls = _ALL_DATA_TYPES[_VALID_TYPES.index(data_type)][1]
-    with closing(_Reader(fname)) as reader:
+    with closing(_Reader(filename)) as reader:
         return _Codegen.read_raw_array_real(cls, *reader.get_funcs())
 
+GameData = collections.namedtuple('GameData', _VALID_TYPES)
+GameData.__doc__ = """namedtuple result type of load_all()"""
+
 def load_all(root_dir='.', /):
-    """Load all the data files into a NamedTuple"""
+    """Load all the data files into a GameData namedtuple.
+
+    "root_dir" can be specified to load the data from somewhere else. If the
+    files have non-standard names, use load_data() instead.
+
+    The fields on the tuple have the same names as the data files, but without
+    '.dat' - for instance events.dat is loaded into events."""
     result = dict((x, load_data(x, path.join(root_dir, x + '.dat')))
                   for x in _VALID_TYPES)
     return GameData(**result)
-
-
-if __name__ == '__main__':
-    data = load_all()
-    for thing in data:
-        print(len(thing))
