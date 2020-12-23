@@ -256,30 +256,8 @@ class _Codegen:
         """Used to check that a given class is never deserialized."""
         return "0; raise ValueError('Tried to parse unexpected type')"
 
-
-class Object:
-    """Generic object base type that powers the rest of the type hierarchy.
-
-    All subclasses of this are dumb struct types that contain no real logic;
-    they simply describe their layout. This class sets up the code for
-    each subclass by hooking __init_subclass__ so it can do parsing, __repr__,
-    etc., without needing a full-blown metaclass.
-
-    All methods besides __init_subclass__ are meant to be called on
-    (all) subclasses.
-    """
-
-    def __init_subclass__(cls):
-        # pylint: disable=exec-used,no-member,too-many-branches
-        """Generates code for subclasses"""
-        layout = [x.strip().split(':', 1) for x in cls._layout.strip().split('\n')]
-        for field in layout:
-            # Append parens as needed, so that we get method calls later on.
-            if not field[1][-1] == ')':
-                field[1] += '()'
-        cls.__slots__ = tuple(x[0] for x in layout)
-        # We dynamically create this code, so that it will be compiled once
-        # and then run at full speed.
+    def generate_code(self, layout, cls_name, /):
+        """Generates the dynamic __init__ code for the given class layout"""
         code = ["""def __init__(self, read_fun=None, tell_fun=None, /, **kwargs):
     if read_fun is None:"""]
         # Start with code to initialize the object as a tuple, including the
@@ -300,14 +278,13 @@ class Object:
             setattr(self, k, v)
         return""")
         # Otherwise, if there is a reader initialize from it.
-        codegen = _Codegen()
         for name, typ in layout:
             if _DEBUG:
                 code.append(
-                    f"    print(f'@{{tell_fun():X}} {cls.__name__} {name}')")
+                    f"    print(f'@{{tell_fun():X}} {cls_name} {name}')")
             index = typ.index('(')
             method_name = typ[:index]
-            method = getattr(codegen, 'read_' + method_name)
+            method = getattr(self, 'read_' + method_name)
             args = []
             if index < len(typ) - 2:
                 args.append(typ[index+1:-1])
@@ -315,9 +292,36 @@ class Object:
                 code.append(method(name, *args))
             else:
                 code.append(f'    self.{name} = ' + method(*args))
+        return '\n'.join(code)
+
+
+class Object:
+    """Generic object base type that powers the rest of the type hierarchy.
+
+    All subclasses of this are dumb struct types that contain no real logic;
+    they simply describe their layout. This class sets up the code for
+    each subclass by hooking __init_subclass__ so it can do parsing, __repr__,
+    etc., without needing a full-blown metaclass.
+
+    All methods besides __init_subclass__ are meant to be called on
+    (all) subclasses.
+    """
+
+    def __init_subclass__(cls):
+        # pylint: disable=exec-used,no-member
+        """Generates code for subclasses"""
+        layout = [x.strip().split(':', 1) for x in cls._layout.strip().split('\n')]
+        for field in layout:
+            # Append parens as needed, so that we get method calls later on.
+            if not field[1][-1] == ')':
+                field[1] += '()'
+        cls.__slots__ = tuple(x[0] for x in layout)
+        # We dynamically create this code, so that it will be compiled once
+        # and then run at full speed.
         localz = {}
-        exec(compile('\n'.join(code), f'<dynamic {cls.__name__} code>', 'exec'),
-                globals(), localz)
+        exec(compile(_Codegen().generate_code(layout, cls.__name__),
+                     f'<dynamic {cls.__name__} code>', 'exec'),
+             globals(), localz)
         __init__ = localz['__init__']
         __init__.__qualname__ = f'{cls.__name__}.__init__'
         cls.__init__ = __init__
