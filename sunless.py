@@ -34,7 +34,6 @@ SETTINGS - A dictionary of Setting objects, keyed by id.
 """
 # pylint: disable=too-few-public-methods,too-many-lines,unused-import
 
-import cProfile
 import collections
 from contextlib import closing
 import io
@@ -143,9 +142,17 @@ class _Codegen:
             shift += 7
         return acc
 
+    def read_byte(self):
+        """Helper for reading a single byte
+
+        Also used as a shortcut for read_bool when a generic truthy value is
+        good enough, instead of an actual bool.
+        """
+        return 'read_fun(1)[0]'
+
     def read_bool(self):
         """Helper for reading a single bool"""
-        return 'read_fun(1)[0]'
+        return f'bool({self.read_byte()})'
 
     def read_int32(self):
         """Helper for reading a single int32"""
@@ -153,14 +160,14 @@ class _Codegen:
 
     def read_optional_int32(self):
         """Read an optional int32, returning None if not present"""
-        return f'{self.read_int32()} if {self.read_bool()} else None'
+        return f'{self.read_int32()} if {self.read_byte()} else None'
 
     def read_optional_int64(self):
         """Read an optional int64, returning None if not present
 
         There aren't actually any int64s in the data.
         """
-        return ('unexpected_int64 if {self.read_bool()} else None')
+        return 'unexpected_int64 if {self.read_byte()} else None'
 
     def read_base_string(self):
         """Read a base UTF-8 string"""
@@ -177,15 +184,15 @@ class _Codegen:
 
     def read_string(self):
         """Read an optional string, returning None if not present"""
-        return f'{self.read_base_string()} if {self.read_bool()} else None'
+        return f'{self.read_base_string()} if {self.read_byte()} else None'
 
     def read_object(self, cls_name, /):
         """Read an optional object field, returning None if not present"""
         # There are two layers of optional: An outer one on the field and an
         # inner one on the object itself. It's essentially redundant, they
         # both mean the same thing.
-        return (f'{cls_name}(read_fun, tell_fun) if {self.read_bool()} ' +
-            f'and {self.read_bool()} else None')
+        return (f'{cls_name}(read_fun, tell_fun) if {self.read_byte()} ' +
+            f'and {self.read_byte()} else None')
 
     def read_datetime(self):
         """Specialty method that doesn't actually read anything"""
@@ -193,7 +200,7 @@ class _Codegen:
 
     def read_optional_datetime(self):
         """Specialty method that (optionally) doesn't read anything"""
-        return f'0 if {self.read_bool()} else None'
+        return f'0 if {self.read_byte()} else None'
 
     def read_raw_array(self, cls_name, /):
         """Read an array of optional objects"""
@@ -220,27 +227,29 @@ class _Codegen:
         argument of the variable to set.
         """
         # Conditionally defined for speed: The common case (weirdly enough) is to
-        # always have the array, but with 0 size.
+        # always have the array, but with 0 size. We use a 0-size tuple for
+        # this, because since they are immutable they are much faster to
+        # create.
         if _DEBUG:
-            return (f'    self.{name} = None if not {self.read_bool()} else ' +
+            return (f'    self.{name} = None if not {self.read_byte()} else ' +
                     f'_Codegen.read_raw_array_real({cls_name}, read_fun, tell_fun)')
-        return f"""    if not {self.read_bool()}:
+        return f"""    if not {self.read_byte()}:
         self.{name} = None
     else:
         alen = read_fun(4)
         if alen == b'\\0\\0\\0\\0':
-            self.{name} = []
+            self.{name} = ()
         else:
             alen = int.from_bytes(alen, 'little', signed=True)
             self.{name} = [{cls_name}(read_fun, tell_fun)
-                if {self.read_bool()} else None for i in range(alen)]"""
+                if {self.read_byte()} else None for i in range(alen)]"""
 
     def read_array_int32(self):
         """Read an optional array of int32s.
 
         Needs special logic because the ints aren't optional.
         """
-        return (f"None if not {self.read_bool()} else " +
+        return (f"None if not {self.read_byte()} else " +
                 f"[{self.read_int32()} for x in range({self.read_int32()})]")
 
     def read_bad_type(self):
@@ -260,11 +269,9 @@ class Object:
     (all) subclasses.
     """
 
-    _labels = 'id,name'
-
     def __init_subclass__(cls):
-        # pylint: disable=exec-used,no-member
-        """Does the thing"""
+        # pylint: disable=exec-used,no-member,too-many-branches
+        """Generates code for subclasses"""
         layout = [x.strip().split(':', 1) for x in cls._layout.strip().split('\n')]
         for field in layout:
             # Append parens as needed, so that we get method calls later on.
@@ -289,7 +296,7 @@ class Object:
             else:
                 value = 0
             code.append(f'        self.{name} = {value!r}')
-        code.append("""        for k, v in kwargs:
+        code.append("""        for k, v in kwargs.items():
             setattr(self, k, v)
         return""")
         # Otherwise, if there is a reader initialize from it.
@@ -318,12 +325,25 @@ class Object:
         fmt = ', '.join(x + '={!r}' for x in cls.__slots__)
         cls._repr_format = f'{cls.__name__}({fmt})'
 
-        cls._str_attrs = cls._labels.split(',')
-        fmt = ', '.join(x + '={}' for x in cls._str_attrs)
-        cls._str_format = f'{cls.__name__}({fmt})'
+        # We sort these to the front.
+        front_attrs = ('id', 'name', 'description')
+        str_attrs = [
+            (front_attrs.index(v[0]) - 100 if v[0] in front_attrs else i,
+                v[0], v[1]) for i,v in enumerate(layout)]
+        str_attrs.sort()
+        # Objects need to be recursively expanded with str(). Enums need to
+        # use str() because repr() doesn't produce an expression which
+        # evaluates to the value (which is against style). Lists are handled
+        # specially, and will use str() because they contain Objects (or
+        # ints). Everything else should use repr().
+        str_attrs = [(x[1], x[1] + (
+            '={!s}' if x[2].startswith('object') or x[2].startswith('enum')
+            else '={!r}')) for x in str_attrs]
+        cls._str_attrs = str_attrs
+        cls._str_begin = f'{cls.__name__}('
 
     def __repr__(self):
-        """Print all the attributes of the class
+        """Print all the attributes of the class.
 
         The result should be an expression that will round-trip back to the
         original result (assuming you did import * form sunlessskies),
@@ -334,9 +354,31 @@ class Object:
                 *[getattr(self, x) for x in self.__slots__])
 
     def __str__(self):
-        """An abbreviated version of the class, only attrs in _labels"""
-        return self._str_format.format(
-                *[getattr(self, x) for x in self._str_attrs])
+        """Print non-default attributes of the class.
+
+        This skips printing all fields that have "default" values, i.e. that
+        evaluate to False in a boolean context. So: None, 0, '', [], etc.
+        Like repr(), this produces an expression that should produce the
+        original result, modulo minor differences like where a string might
+        have been ommitted entirely (None) and will be reconstructed as ''.
+        """
+        acc = []
+        for attr, fmt in self._str_attrs:
+            value = getattr(self, attr)
+            if not value:
+                continue
+            if not isinstance(value, list):
+                acc.append(fmt.format(value))
+            else:
+                # Special handling for arrays: This takes advantage of the
+                # fact that it shares the same delimiter: ', '. Arrays are
+                # always of either objects or ints, so either way we want to
+                # recurse with str().
+                sublist = [str(x) for x in value]
+                sublist[0] = attr + '=[' + sublist[0]
+                sublist[-1] += ']'
+                acc.extend(sublist)
+        return self._str_begin + ', '.join(acc) + ')'
 
 
 class Area(Object):
@@ -374,7 +416,6 @@ class AspectQPossession(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,target_quality'
 
 
 class Availability(Object):
@@ -391,7 +432,6 @@ class Availability(Object):
     sale_description:string
     id:int32
     """
-    _labels = 'id,quality'
 
 
 class Bargain(Object):
@@ -424,7 +464,6 @@ class BargainQRequirement(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,min_level,max_level,associated_quality'
 
 
 class Branch(Object):
@@ -472,7 +511,6 @@ class BranchQRequirement(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,min_level,max_level,associated_quality'
 
 
 class Completion(Object):
@@ -507,7 +545,6 @@ class CompletionQEffect(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,associated_quality'
 
 
 class CompletionQRequirement(Object):
@@ -521,7 +558,6 @@ class CompletionQRequirement(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,min_level,max_level,associated_quality'
 
 
 class Deck(Object):
@@ -621,7 +657,6 @@ class EventQEffect(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,associated_quality'
 
 
 class EventQRequirement(Object):
@@ -635,7 +670,6 @@ class EventQRequirement(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,min_level,max_level,associated_quality'
 
 
 class Exchange(Object):
@@ -684,7 +718,6 @@ class PersonaQEffect(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,associated_quality'
 
 
 class PersonaQRequirement(Object):
@@ -698,7 +731,6 @@ class PersonaQRequirement(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,min_level,max_level,associated_quality'
 
 
 class Prospect(Object):
@@ -738,7 +770,6 @@ class ProspectQEffect(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,associated_quality'
 
 
 class ProspectQRequirement(Object):
@@ -755,7 +786,6 @@ class ProspectQRequirement(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,min_level,max_level,associated_quality'
 
 
 class Shop(Object):
@@ -783,7 +813,6 @@ class ShopQRequirement(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,min_level,max_level,associated_quality'
 
 
 class Stub(Object):
@@ -800,7 +829,6 @@ class QEnhancement(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,level,associated_quality'
 
 # public enum QualityAllowedOn
 # {
@@ -1040,7 +1068,6 @@ class UserQPossession(Object):
     associated_quality:object(Quality)
     id:int32
     """
-    _labels = 'id,level,associated_quality'
 
 
 class UserWorldPrivilege(Object):
@@ -1052,7 +1079,6 @@ class UserWorldPrivilege(Object):
     user:object(User)
     id:int32
     """
-    _labels = 'id,user'
 
 
 class World(Object):
@@ -1115,6 +1141,7 @@ _VALID_TYPES = [x[0] for x in _ALL_DATA_TYPES] + ['backers']
 GameData = collections.namedtuple('GameData', _VALID_TYPES)
 
 def load_backers(fname=None, /):
+    """Load the backers list"""
     fname = fname or 'backers.dat'
     with closing(_Reader(fname)) as reader:
         backers = [x.decode() for x in reader.read_fun().split(b'\r\n')]
@@ -1137,16 +1164,12 @@ def load_data(data_type, fname=None, /):
 
 def load_all(root_dir='.', /):
     """Load all the data files into a NamedTuple"""
-    data = dict((x, load_data(x, path.join(root_dir, x + '.dat')))
-                for x in _VALID_TYPES)
-    return GameData(**data)
+    result = dict((x, load_data(x, path.join(root_dir, x + '.dat')))
+                  for x in _VALID_TYPES)
+    return GameData(**result)
 
 
 if __name__ == '__main__':
-    #with cProfile.Profile() as pr:
     data = load_all()
-    #    pr.print_stats()
     for thing in data:
         print(len(thing))
-
-    print(repr(Event()))
