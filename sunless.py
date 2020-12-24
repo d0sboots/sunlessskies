@@ -133,7 +133,7 @@ class _Codegen:
             shift += 7
         return acc
 
-    def read_byte(self):
+    def _read_byte(self):
         """Helper for reading a single byte
 
         Also used as a shortcut for read_bool when a generic truthy value is
@@ -143,7 +143,7 @@ class _Codegen:
 
     def read_bool(self):
         """Helper for reading a single bool"""
-        return f'bool({self.read_byte()})'
+        return f'bool({self._read_byte()})'
 
     def read_int32(self):
         """Helper for reading a single int32"""
@@ -151,14 +151,14 @@ class _Codegen:
 
     def read_optional_int32(self):
         """Read an optional int32, returning None if not present"""
-        return f'{self.read_int32()} if {self.read_byte()} else None'
+        return f'{self.read_int32()} if {self._read_byte()} else None'
 
     def read_optional_int64(self):
         """Read an optional int64, returning None if not present
 
         There aren't actually any int64s in the data.
         """
-        return 'unexpected_int64 if {self.read_byte()} else None'
+        return 'unexpected_int64 if {self._read_byte()} else None'
 
     def read_base_string(self):
         """Read a base UTF-8 string"""
@@ -175,15 +175,15 @@ class _Codegen:
 
     def read_string(self):
         """Read an optional string, returning None if not present"""
-        return f'{self.read_base_string()} if {self.read_byte()} else None'
+        return f'{self.read_base_string()} if {self._read_byte()} else None'
 
     def read_object(self, cls_name, /):
         """Read an optional object field, returning None if not present"""
         # There are two layers of optional: An outer one on the field and an
         # inner one on the object itself. It's essentially redundant, they
         # both mean the same thing.
-        return (f'{cls_name}(read_fun, tell_fun) if {self.read_byte()} ' +
-            f'and {self.read_byte()} else None')
+        return (f'{cls_name}(read_fun, tell_fun) if {self._read_byte()} ' +
+            f'and {self._read_byte()} else None')
 
     def read_enum(self, cls_name, /):
         """Read an enum, which is just a typed int"""
@@ -191,7 +191,7 @@ class _Codegen:
 
     def read_optional_enum(self, cls_name, /):
         """Read an optional enum, returning None if not present"""
-        return f'{self.read_enum(cls_name)} if {self.read_byte()} else None'
+        return f'{self.read_enum(cls_name)} if {self._read_byte()} else None'
 
     def read_datetime(self):
         """Specialty method that doesn't actually read anything"""
@@ -199,7 +199,7 @@ class _Codegen:
 
     def read_optional_datetime(self):
         """Specialty method that (optionally) doesn't read anything"""
-        return f'0 if {self.read_byte()} else None'
+        return f'0 if {self._read_byte()} else None'
 
     def read_raw_array(self, cls_name, /):
         """Read an array of optional objects"""
@@ -230,9 +230,9 @@ class _Codegen:
         # this, because since they are immutable they are much faster to
         # create.
         if _DEBUG:
-            return (f'    self.{name} = None if not {self.read_byte()} else ' +
+            return (f'    self.{name} = None if not {self._read_byte()} else ' +
                     f'_Codegen.read_raw_array_real({cls_name}, read_fun, tell_fun)')
-        return f"""    if not {self.read_byte()}:
+        return f"""    if not {self._read_byte()}:
         self.{name} = None
     else:
         alen = read_fun(4)
@@ -241,21 +241,21 @@ class _Codegen:
         else:
             alen = int.from_bytes(alen, 'little', signed=True)
             self.{name} = [{cls_name}(read_fun, tell_fun)
-                if {self.read_byte()} else None for i in range(alen)]"""
+                if {self._read_byte()} else None for i in range(alen)]"""
 
     def read_array_int32(self):
         """Read an optional array of int32s.
 
         Needs special logic because the ints aren't optional.
         """
-        return (f"None if not {self.read_byte()} else " +
+        return (f"None if not {self._read_byte()} else " +
                 f"[{self.read_int32()} for x in range({self.read_int32()})]")
 
     def read_bad_type(self):
         """Used to check that a given class is never deserialized."""
         return "0; raise ValueError('Tried to parse unexpected type')"
 
-    def generate_code(self, layout, cls_name, /):
+    def generate_init(self, layout, cls_name, /):
         """Generates the dynamic __init__ code for the given class layout"""
         code = ["""def __init__(self, read_fun=None, tell_fun=None, /, **kwargs):
     if read_fun is None:"""]
@@ -293,6 +293,23 @@ class _Codegen:
                 code.append(f'    self.{name} = ' + method(*args))
         return '\n'.join(code)
 
+    def generate_do_all(self, layout, cls_name, /):
+        """Generates the dynamic do_all code for the given class layout"""
+        code = [f"""def do_all(self, fun, /):
+    fun(self, {cls_name})"""]
+        for name, typ in layout:
+            if typ.startswith('object'):
+                code.append(f"""    tmp = self.{name}
+    if tmp:
+        tmp.do_all(fun)""")
+            elif typ.startswith('array('):
+                code.append(f"""    arr = self.{name}
+    if arr:
+        for tmp in arr:
+            if tmp:
+                tmp.do_all(fun)""")
+        return '\n'.join(code)
+
 
 class Object:
     """Generic object base type that powers the rest of the type hierarchy.
@@ -318,12 +335,16 @@ class Object:
         # We dynamically create this code, so that it will be compiled once
         # and then run at full speed.
         localz = {}
-        exec(compile(_Codegen().generate_code(layout, cls.__name__),
+        exec(compile(_Codegen().generate_init(layout, cls.__name__) + '\n' +
+                     _Codegen().generate_do_all(layout, cls.__name__),
                      f'<dynamic {cls.__name__} code>', 'exec'),
              globals(), localz)
         __init__ = localz['__init__']
         __init__.__qualname__ = f'{cls.__name__}.__init__'
         cls.__init__ = __init__
+        do_all_fun = localz['do_all']
+        do_all_fun.__qualname__ = f'{cls.__name__}.do_all'
+        cls.do_all = do_all_fun
         # Precompute replacement string for speed
         fmt = ', '.join(x + '={!r}' for x in cls.__slots__)
         cls._repr_format = f'{cls.__name__}({fmt})'
@@ -1255,3 +1276,44 @@ def load_all(root_dir='.', /):
     result = dict((x, load_data(x, path.join(root_dir, x + '.dat')))
                   for x in _VALID_TYPES)
     return GameData(**result)
+
+def do_all(obj, fun, /):
+    """Apply the given fun recursively across obj and all subobjects.
+
+    The data structures of Sunless Skies are often deeply nested, which makes
+    certain operations difficult. do_all() is optimized for traversing this
+    object hierarchy more rapidly than a generic depth-first search, by taking
+    advantage of the layout information that the types contain.
+
+    "obj" must be a subtype of sunless.Object, or an iterable of them, or a
+    GameData.
+
+    "fun" is a function taking two parameters - the object and its type. It
+    will be called in a depth-first manner, visiting the nodes in "natural"
+    order, i.e. the order they are declared.
+    """
+    if isinstance(obj, Object):
+        obj.do_all(fun)
+    elif isinstance(obj, GameData):
+        for k, val in obj._asdict().items():
+            if k == 'backers':
+                continue
+            for i in val:
+                i.do_all(fun)
+    else:  # Assume iterable
+        for val in obj:
+            val.do_all(fun)
+
+def find_all(obj, cls, /):
+    """Find all instances of cls recursively across obj.
+
+    This uses do_all() to recursively search inside obj (including obj
+    itself) for instances where the type is "cls". It will only work for
+    subtypes of sunless.Object, i.e. you can't find all ints this way.
+    """
+    acc = []
+    def find_fun(res, res_cls, /):
+        if res_cls == cls:
+            acc.append(res)
+    do_all(obj, find_fun)
+    return acc
